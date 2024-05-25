@@ -6,6 +6,7 @@ edition = "2018"
 
 [dependencies]
 cdt = { path = "../cdt" }
+gltf = { workspace = true }
 nurbs = { path = "../nurbs" }
 step = { path = "../step" }
 

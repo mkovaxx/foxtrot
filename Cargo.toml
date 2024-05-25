@@ -14,3 +14,6 @@ members = [
 exclude = [
     "wasm",
 ]
+
+[workspace.dependencies]
+gltf = "1.4.1"
