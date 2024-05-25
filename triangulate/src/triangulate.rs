@@ -2,7 +2,6 @@ use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
 
 use glm::{DMat4, DVec3, DVec4, U32Vec3};
-use gltf::json as gltf_json;
 use log::{error, info, warn};
 use nalgebra_glm as glm;
 
@@ -261,10 +260,32 @@ pub fn triangulate(s: &StepFile) -> (Mesh, Stats) {
     (mesh, stats)
 }
 
-pub fn convert_to_node_tree(step: &StepFile) -> gltf_json::Root {
-    let mut root = gltf_json::Root::default();
+#[derive(Debug, Clone)]
+pub struct NodeTree {
+    pub nodes: Vec<Node>,
+    pub vertices: Vec<[f32; 3]>,
+    pub triangles: Vec<[u32; 3]>,
+}
 
-    root
+#[derive(Debug, Clone)]
+pub struct Node {
+    pub transform: DMat4,
+    pub triangle_index: u32,
+    pub triangle_count: u32,
+    pub children: Vec<NodeIdx>,
+}
+
+#[derive(Debug, Clone)]
+pub struct NodeIdx(pub u32);
+
+pub fn convert_to_node_tree(step: &StepFile) -> NodeTree {
+    let mut tree = NodeTree {
+        nodes: vec![],
+        vertices: vec![],
+        triangles: vec![],
+    };
+
+    tree
 }
 
 fn item_defined_transformation(s: &StepFile, t: Id<ItemDefinedTransformation_>) -> DMat4 {
