@@ -1,4 +1,4 @@
-#[derive(Default)]
+#[derive(Default, Debug)]
 pub struct Stats {
     pub num_shells: usize,
     pub num_faces: usize,

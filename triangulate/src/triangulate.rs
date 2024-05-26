@@ -285,6 +285,160 @@ pub fn convert_to_node_tree(step: &StepFile) -> NodeTree {
         triangles: vec![],
     };
 
+    let styled_items: Vec<_> = step
+        .0
+        .iter()
+        .filter_map(|e| MechanicalDesignGeometricPresentationRepresentation_::try_from_entity(e))
+        .flat_map(|m| m.items.iter())
+        .filter_map(|item| step.entity(item.cast::<StyledItem_>()))
+        .collect();
+    let brep_colors: HashMap<_, DVec3> = styled_items
+        .iter()
+        .filter_map(|styled| {
+            if styled.styles.len() != 1 {
+                None
+            } else {
+                presentation_style_color(step, styled.styles[0]).map(|c| (styled.item, c))
+            }
+        })
+        .collect();
+
+    // Store a map of parent -> (child, transform)
+    let mut transform_stack = build_transform_stack(step, false);
+    let mut roots = transform_stack_roots(&transform_stack);
+    // The transformation graph isn't directional (because STEP is a Good File
+    // Format), so if it's got more than one root, assume it's backwards.  We
+    // are assuming that directions in the graph are consistent within the file,
+    // until we find a counterexample.
+    if roots.len() > 1 {
+        info!("Flipping transform stack");
+        transform_stack = build_transform_stack(step, true);
+        roots = transform_stack_roots(&transform_stack);
+    }
+    let mut todo: Vec<_> = roots.into_iter().map(|v| (v, DMat4::identity())).collect();
+    if todo.len() > 1 {
+        warn!("Transformation stack has more than one root!");
+    }
+
+    // Store a map of ShapeRepresentationRelationships, which some models
+    // use to map from axes to specific instances
+    let mut shape_rep_relationship: HashMap<Id<_>, Vec<Id<_>>> = HashMap::new();
+    for (r1, r2) in step
+        .0
+        .iter()
+        .filter_map(|e| ShapeRepresentationRelationship_::try_from_entity(e))
+        .map(|e| (e.rep_1, e.rep_2))
+    {
+        shape_rep_relationship.entry(r1).or_default().push(r2);
+    }
+
+    let mut to_mesh: HashMap<Id<_>, Vec<_>> = HashMap::new();
+    while let Some((id, mat)) = todo.pop() {
+        for child in shape_rep_relationship.get(&id).unwrap_or(&vec![]) {
+            todo.push((*child, mat));
+        }
+        if let Some(children) = transform_stack.get(&id) {
+            for (child, next_mat) in children {
+                todo.push((*child, mat * next_mat));
+            }
+        } else {
+            // Bind this transform to the RepresentationItem, which is
+            // either a ManifoldSolidBrep or a ShellBasedSurfaceModel
+            let items = match &step[id] {
+                Entity::AdvancedBrepShapeRepresentation(b) => &b.items,
+                Entity::ShapeRepresentation(b) => &b.items,
+                Entity::ManifoldSurfaceShapeRepresentation(b) => &b.items,
+                e => panic!("Could not get shape from {:?}", e),
+            };
+
+            for m in items.iter() {
+                match &step[*m] {
+                    Entity::ManifoldSolidBrep(_)
+                    | Entity::BrepWithVoids(_)
+                    | Entity::ShellBasedSurfaceModel(_) => to_mesh.entry(*m).or_default().push(mat),
+                    Entity::Axis2Placement3d(_) => (),
+                    e => warn!("Skipping {:?}", e),
+                }
+            }
+        }
+    }
+    // If there are items in breps that aren't attached to a transformation
+    // chain, then draw them individually (with an identity matrix)
+    if to_mesh.is_empty() {
+        step.0
+            .iter()
+            .enumerate()
+            .filter(|(_i, e)| match e {
+                Entity::ManifoldSolidBrep(_)
+                | Entity::BrepWithVoids(_)
+                | Entity::ShellBasedSurfaceModel(_) => true,
+                _ => false,
+            })
+            .map(|(i, _e)| Id::new(i))
+            .for_each(|i| to_mesh.entry(i).or_default().push(DMat4::identity()));
+    }
+
+    let mut mesh = Mesh::default();
+    let mut stats = Stats::default();
+
+    for (id, mats) in &to_mesh {
+        let v_start = mesh.verts.len();
+        let t_start = mesh.triangles.len();
+
+        match &step[*id] {
+            Entity::ManifoldSolidBrep(b) => closed_shell(step, b.outer, &mut mesh, &mut stats),
+            Entity::ShellBasedSurfaceModel(b) => {
+                for v in &b.sbsm_boundary {
+                    shell(step, *v, &mut mesh, &mut stats);
+                }
+            }
+            Entity::BrepWithVoids(b) =>
+            // TODO: handle voids
+            {
+                closed_shell(step, b.outer, &mut mesh, &mut stats)
+            }
+            _ => {
+                warn!("Skipping {:?} (not a known solid)", step[*id]);
+                continue;
+            }
+        };
+
+        // Pick out a color from the color map and apply it to each
+        // newly-created vertex
+        let color = brep_colors
+            .get(id)
+            .map(|c| *c)
+            .unwrap_or(DVec3::new(0.5, 0.5, 0.5));
+
+        let v_end = mesh.verts.len();
+        let t_end = mesh.triangles.len();
+
+        // Create a Node
+        for mat in mats {
+            tree.nodes.push(Node {
+                transform: *mat,
+                triangle_index: t_start as u32,
+                triangle_count: t_end as u32,
+                children: vec![],
+            });
+        }
+    }
+
+    dbg!(mesh.verts.len());
+    dbg!(mesh.triangles.len());
+    dbg!(stats);
+
+    tree.vertices = mesh
+        .verts
+        .iter()
+        .map(|v| [v.pos.x as f32, v.pos.y as f32, v.pos.z as f32])
+        .collect();
+    tree.triangles = mesh
+        .triangles
+        .iter()
+        .map(|t| [t.verts.x, t.verts.y, t.verts.z])
+        .collect();
+
     tree
 }
 
