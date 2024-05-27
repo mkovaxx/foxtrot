@@ -101,11 +101,11 @@ fn export(path: &str, tree: triangulate::triangulate::NodeTree) {
         buffer: buffer,
         byte_length: USize64::from(indices_view_length),
         byte_offset: Some(USize64::from(indices_view_offset)),
-        byte_stride: Some(gltf_json::buffer::Stride(mem::size_of::<Triangle>())),
+        byte_stride: Some(gltf_json::buffer::Stride(mem::size_of::<u32>())),
         extensions: Default::default(),
         extras: Default::default(),
         name: None,
-        target: Some(Valid(gltf_json::buffer::Target::ArrayBuffer)),
+        target: Some(Valid(gltf_json::buffer::Target::ElementArrayBuffer)),
     });
 
     // translate Nodes into glTF nodes
@@ -163,14 +163,11 @@ fn export(path: &str, tree: triangulate::triangulate::NodeTree) {
         });
     }
 
-    let json_string = gltf_json::serialize::to_string(&root).expect("Serialization error");
-
-    let mut json_offset = json_string.len();
-
-    align_to_multiple_of_four(&mut json_offset);
-
-    // TODO: fix this
-    let root_nodes = vec![gltf_json::Index::<gltf_json::Node>::new(0)];
+    let root_nodes = tree
+        .roots
+        .into_iter()
+        .map(|node_idx| gltf_json::Index::<gltf_json::Node>::new(node_idx.0))
+        .collect();
 
     root.push(gltf_json::Scene {
         extensions: Default::default(),
@@ -179,12 +176,20 @@ fn export(path: &str, tree: triangulate::triangulate::NodeTree) {
         nodes: root_nodes,
     });
 
+    let json_string = gltf_json::serialize::to_string(&root).expect("Serialization error");
+
+    let mut json_offset = json_string.len();
+
+    align_to_multiple_of_four(&mut json_offset);
+
+    //println!("{}", &json_string);
+
     let glb = gltf::binary::Glb {
         header: gltf::binary::Header {
             magic: *b"glTF",
             version: 2,
             // N.B., the size of binary glTF file is limited to range of `u32`.
-            length: (json_offset + positions_view_length)
+            length: (json_offset + buffer_data.len())
                 .try_into()
                 .expect("file size exceeds binary glTF limit"),
         },
