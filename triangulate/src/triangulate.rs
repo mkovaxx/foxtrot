@@ -264,6 +264,7 @@ pub fn triangulate(s: &StepFile) -> (Mesh, Stats) {
 pub struct NodeTree {
     pub nodes: Vec<Node>,
     pub roots: Vec<NodeIdx>,
+    pub meshes: Vec<NodeMesh>,
     pub vertices: Vec<[f32; 3]>,
     pub triangles: Vec<[u32; 3]>,
 }
@@ -271,83 +272,42 @@ pub struct NodeTree {
 #[derive(Debug, Clone)]
 pub struct Node {
     pub transform: DMat4,
-    pub triangle_index: u32,
-    pub triangle_count: u32,
     pub children: Vec<NodeIdx>,
+    pub mesh: Option<MeshIdx>,
 }
 
 #[derive(Debug, Clone)]
+pub struct NodeMesh {
+    pub triangle_index: u32,
+    pub triangle_count: u32,
+}
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct NodeIdx(pub u32);
+
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+pub struct MeshIdx(pub u32);
 
 pub fn convert_to_node_tree(step: &StepFile) -> NodeTree {
     let mut tree = NodeTree {
         nodes: vec![],
         roots: vec![],
+        meshes: vec![],
         vertices: vec![],
         triangles: vec![],
     };
 
-    // The transformation graph isn't directional (because STEP is a Good File
-    // Format), so if it's got more than one root, assume it's backwards.  We
-    // are assuming that directions in the graph are consistent within the file,
-    // until we find a counterexample.
-    let flip = false;
-
-    // Store a map of parent -> (child, transform)
-    let transform_stack = build_transform_stack(step, flip);
-
-    dbg!(&transform_stack);
-
-    // Store a map of ShapeRepresentationRelationships, which some models
-    // use to map from axes to specific instances
-    let mut shape_rep_relationship: HashMap<Id<_>, Vec<Id<_>>> = HashMap::new();
-    for (r1, r2) in step
-        .0
-        .iter()
-        .filter_map(|e| ShapeRepresentationRelationship_::try_from_entity(e))
-        .map(|e| (e.rep_1, e.rep_2))
-    {
-        shape_rep_relationship.entry(r1).or_default().push(r2);
-    }
-
-    dbg!(&shape_rep_relationship);
-
-    let mut all_rep_ids: HashSet<Id<_>> = HashSet::new();
-    for (parent_id, children) in &transform_stack {
-        all_rep_ids.insert(*parent_id);
-        for (child_id, _) in children {
-            all_rep_ids.insert(*child_id);
-        }
-    }
-
-    if all_rep_ids.is_empty() {
-        step.0
-            .iter()
-            .enumerate()
-            .filter(|(_i, e)| match e {
-                Entity::ManifoldSolidBrep(_)
-                | Entity::BrepWithVoids(_)
-                | Entity::ShellBasedSurfaceModel(_) => true,
-                _ => false,
-            })
-            .map(|(i, _e)| Id::new(i))
-            .for_each(|i| {
-                all_rep_ids.insert(i);
-            });
-    }
-
-    dbg!(&all_rep_ids);
-
     let mut mesh = Mesh::default();
     let mut stats = Stats::default();
 
-    let mut rep_id_to_node_idx: HashMap<Id<_>, usize> = HashMap::default();
+    let mut item_to_mesh_idx: HashMap<Id<_>, usize> = HashMap::default();
 
-    for rep_id in &all_rep_ids {
+    // create NodeMeshes
+    for (i, entity) in step.0.iter().enumerate() {
         let v_start = mesh.verts.len();
         let t_start = mesh.triangles.len();
 
-        match &step[*rep_id] {
+        match entity {
             Entity::ManifoldSolidBrep(b) => closed_shell(step, b.outer, &mut mesh, &mut stats),
             Entity::ShellBasedSurfaceModel(b) => {
                 for v in &b.sbsm_boundary {
@@ -359,7 +319,7 @@ pub fn convert_to_node_tree(step: &StepFile) -> NodeTree {
                 closed_shell(step, b.outer, &mut mesh, &mut stats)
             }
             _ => {
-                warn!("Skipping {:?} (not a known solid)", step[*rep_id]);
+                warn!("Skipping {:?} (not a known solid)", entity);
                 continue;
             }
         };
@@ -367,40 +327,24 @@ pub fn convert_to_node_tree(step: &StepFile) -> NodeTree {
         let v_end = mesh.verts.len();
         let t_end = mesh.triangles.len();
 
-        // Create a Node
-        let node_idx = tree.nodes.len();
-        tree.nodes.push(Node {
-            transform: DMat4::identity(),
+        // Create a NodeMesh
+        let mesh_idx = tree.meshes.len();
+        tree.meshes.push(NodeMesh {
             triangle_index: t_start as u32,
             triangle_count: (t_end - t_start) as u32,
-            children: vec![],
         });
 
-        rep_id_to_node_idx.insert(*rep_id, node_idx);
-    }
-
-    let mut roots: HashSet<Id<_>> = all_rep_ids;
-
-    // Register children
-    for (parent_id, children) in &transform_stack {
-        let parent_node_idx = rep_id_to_node_idx[parent_id];
-        for (child_id, mat) in children {
-            roots.remove(child_id);
-            let child_node_idx = rep_id_to_node_idx[child_id];
-            tree.nodes[child_node_idx].transform = *mat;
-            tree.nodes[parent_node_idx]
-                .children
-                .push(NodeIdx(child_node_idx as u32));
-        }
+        let item_id = Id::<RepresentationItem>::new(i);
+        item_to_mesh_idx.insert(item_id, mesh_idx);
     }
 
     dbg!(mesh.verts.len());
     dbg!(mesh.triangles.len());
     dbg!(stats);
 
-    tree.roots = roots
-        .iter()
-        .map(|rep_id| NodeIdx(rep_id_to_node_idx[rep_id] as u32))
+    tree.roots = item_to_mesh_idx
+        .values()
+        .map(|i| NodeIdx(*i as u32))
         .collect();
 
     tree.vertices = mesh

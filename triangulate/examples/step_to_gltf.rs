@@ -1,9 +1,9 @@
 use clap::{App, Arg};
 use gltf::json::{self as gltf_json, validation::USize64};
-use std::{borrow::Cow, convert::TryInto, mem};
+use std::{borrow::Cow, collections::HashMap, convert::TryInto, mem};
 
 use step::step_file::StepFile;
-use triangulate::triangulate::convert_to_node_tree;
+use triangulate::triangulate::{convert_to_node_tree, MeshIdx, NodeIdx};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
@@ -108,13 +108,15 @@ fn export(path: &str, tree: triangulate::triangulate::NodeTree) {
         target: Some(Valid(gltf_json::buffer::Target::ElementArrayBuffer)),
     });
 
-    // translate Nodes into glTF nodes
-    for node in tree.nodes {
-        let indices_offset = node.triangle_index as u64 * mem::size_of::<Triangle>() as u64;
+    let mut mesh_id_map: HashMap<MeshIdx, gltf_json::Index<gltf_json::Mesh>> = HashMap::new();
+
+    // translate NodeMeshes into glTF meshes
+    for (i, mesh) in tree.meshes.iter().enumerate() {
+        let indices_offset = mesh.triangle_index as u64 * mem::size_of::<Triangle>() as u64;
         let indices = root.push(gltf_json::Accessor {
             buffer_view: Some(indices_view),
             byte_offset: Some(USize64(indices_offset)),
-            count: USize64::from(3 * node.triangle_count as u64),
+            count: USize64::from(3 * mesh.triangle_count as u64),
             component_type: Valid(gltf_json::accessor::GenericComponentType(
                 gltf_json::accessor::ComponentType::U32,
             )),
@@ -142,7 +144,7 @@ fn export(path: &str, tree: triangulate::triangulate::NodeTree) {
             targets: None,
         };
 
-        let mesh = root.push(gltf_json::Mesh {
+        let mesh_idx = root.push(gltf_json::Mesh {
             extensions: Default::default(),
             extras: Default::default(),
             name: None,
@@ -150,6 +152,11 @@ fn export(path: &str, tree: triangulate::triangulate::NodeTree) {
             weights: None,
         });
 
+        mesh_id_map.insert(MeshIdx(i as u32), mesh_idx);
+    }
+
+    // translate Nodes into glTF nodes
+    for node in tree.nodes {
         let children = node
             .children
             .into_iter()
@@ -157,7 +164,7 @@ fn export(path: &str, tree: triangulate::triangulate::NodeTree) {
             .collect();
 
         let node = root.push(gltf_json::Node {
-            mesh: Some(mesh),
+            mesh: node.mesh.map(|mesh_id| mesh_id_map[&mesh_id]),
             children: Some(children),
             ..Default::default()
         });
