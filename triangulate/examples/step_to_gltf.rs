@@ -3,7 +3,7 @@ use gltf::json::{self as gltf_json, validation::USize64};
 use std::{borrow::Cow, collections::HashMap, convert::TryInto, mem};
 
 use step::step_file::StepFile;
-use triangulate::triangulate::{convert_to_node_tree, MeshIdx, NodeIdx};
+use triangulate::triangulate::{convert_to_node_tree, MeshIdx};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
@@ -147,7 +147,7 @@ fn export(path: &str, tree: triangulate::triangulate::NodeTree) {
         let mesh_idx = root.push(gltf_json::Mesh {
             extensions: Default::default(),
             extras: Default::default(),
-            name: None,
+            name: mesh.name.clone(),
             primitives: vec![primitive],
             weights: None,
         });
@@ -163,8 +163,12 @@ fn export(path: &str, tree: triangulate::triangulate::NodeTree) {
             .map(|child_idx| gltf_json::Index::<gltf_json::Node>::new(child_idx.0))
             .collect();
 
+        let matrix: [f32; 16] = node.transform.as_slice().try_into().unwrap();
+
         let node = root.push(gltf_json::Node {
             mesh: node.mesh.map(|mesh_id| mesh_id_map[&mesh_id]),
+            name: node.name,
+            matrix: Some(matrix),
             children: Some(children),
             ..Default::default()
         });

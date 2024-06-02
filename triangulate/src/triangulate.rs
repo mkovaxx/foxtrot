@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
 
-use glm::{DMat4, DVec3, DVec4, U32Vec3};
+use glm::{DMat4, DVec3, DVec4, Mat4, U32Vec3};
 use log::{error, info, warn};
 use nalgebra_glm as glm;
 
@@ -271,24 +271,119 @@ pub struct NodeTree {
 
 #[derive(Debug, Clone)]
 pub struct Node {
-    pub transform: DMat4,
+    pub transform: Mat4,
     pub children: Vec<NodeIdx>,
     pub mesh: Option<MeshIdx>,
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 pub struct NodeMesh {
     pub triangle_index: u32,
     pub triangle_count: u32,
+    pub name: Option<String>,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct NodeIdx(pub u32);
 
-#[derive(Debug, Clone, Eq, PartialEq, Hash)]
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
 pub struct MeshIdx(pub u32);
 
 pub fn convert_to_node_tree(step: &StepFile) -> NodeTree {
+    let styled_items: Vec<_> = step
+        .0
+        .iter()
+        .filter_map(|e| MechanicalDesignGeometricPresentationRepresentation_::try_from_entity(e))
+        .flat_map(|m| m.items.iter())
+        .filter_map(|item| step.entity(item.cast::<StyledItem_>()))
+        .collect();
+    let brep_colors: HashMap<_, DVec3> = styled_items
+        .iter()
+        .filter_map(|styled| {
+            if styled.styles.len() != 1 {
+                None
+            } else {
+                presentation_style_color(step, styled.styles[0]).map(|c| (styled.item, c))
+            }
+        })
+        .collect();
+
+    // Store a map of parent -> (child, transform)
+    let mut transform_stack = build_transform_stack(step, false);
+    let mut roots = transform_stack_roots(&transform_stack);
+    // The transformation graph isn't directional (because STEP is a Good File
+    // Format), so if it's got more than one root, assume it's backwards.  We
+    // are assuming that directions in the graph are consistent within the file,
+    // until we find a counterexample.
+    if roots.len() > 1 {
+        info!("Flipping transform stack");
+        transform_stack = build_transform_stack(step, true);
+        roots = transform_stack_roots(&transform_stack);
+    }
+    let mut todo: Vec<_> = roots.into_iter().map(|v| (v, DMat4::identity())).collect();
+    if todo.len() > 1 {
+        warn!("Transformation stack has more than one root!");
+    }
+
+    // Store a map of ShapeRepresentationRelationships, which some models
+    // use to map from axes to specific instances
+    let mut shape_rep_relationship: HashMap<Id<_>, Vec<Id<_>>> = HashMap::new();
+    for (r1, r2) in step
+        .0
+        .iter()
+        .filter_map(|e| ShapeRepresentationRelationship_::try_from_entity(e))
+        .map(|e| (e.rep_1, e.rep_2))
+    {
+        shape_rep_relationship.entry(r1).or_default().push(r2);
+    }
+
+    let mut to_mesh: HashMap<Id<_>, Vec<_>> = HashMap::new();
+    while let Some((id, mat)) = todo.pop() {
+        for child in shape_rep_relationship.get(&id).unwrap_or(&vec![]) {
+            todo.push((*child, mat));
+        }
+        if let Some(children) = transform_stack.get(&id) {
+            for (child, next_mat) in children {
+                todo.push((*child, mat * next_mat));
+            }
+        } else {
+            // Bind this transform to the RepresentationItem, which is
+            // either a ManifoldSolidBrep or a ShellBasedSurfaceModel
+            let items = match &step[id] {
+                Entity::AdvancedBrepShapeRepresentation(b) => &b.items,
+                Entity::ShapeRepresentation(b) => &b.items,
+                Entity::ManifoldSurfaceShapeRepresentation(b) => &b.items,
+                e => panic!("Could not get shape from {:?}", e),
+            };
+
+            for m in items.iter() {
+                match &step[*m] {
+                    Entity::ManifoldSolidBrep(_)
+                    | Entity::BrepWithVoids(_)
+                    | Entity::ShellBasedSurfaceModel(_) => to_mesh.entry(*m).or_default().push(mat),
+                    Entity::Axis2Placement3d(_) => (),
+                    e => warn!("Skipping {:?}", e),
+                }
+            }
+        }
+    }
+    // If there are items in breps that aren't attached to a transformation
+    // chain, then draw them individually (with an identity matrix)
+    if to_mesh.is_empty() {
+        step.0
+            .iter()
+            .enumerate()
+            .filter(|(_i, e)| match e {
+                Entity::ManifoldSolidBrep(_)
+                | Entity::BrepWithVoids(_)
+                | Entity::ShellBasedSurfaceModel(_) => true,
+                _ => false,
+            })
+            .map(|(i, _e)| Id::new(i))
+            .for_each(|i| to_mesh.entry(i).or_default().push(DMat4::identity()));
+    }
+
     let mut tree = NodeTree {
         nodes: vec![],
         roots: vec![],
@@ -300,52 +395,62 @@ pub fn convert_to_node_tree(step: &StepFile) -> NodeTree {
     let mut mesh = Mesh::default();
     let mut stats = Stats::default();
 
-    let mut item_to_mesh_idx: HashMap<Id<_>, usize> = HashMap::default();
-
     // create NodeMeshes
-    for (i, entity) in step.0.iter().enumerate() {
+    for (item_id, transforms) in to_mesh {
+        let entity = &step[item_id];
+
         let v_start = mesh.verts.len();
         let t_start = mesh.triangles.len();
-
-        match entity {
-            Entity::ManifoldSolidBrep(b) => closed_shell(step, b.outer, &mut mesh, &mut stats),
+        let name = match entity {
+            Entity::ManifoldSolidBrep(b) => {
+                closed_shell(step, b.outer, &mut mesh, &mut stats);
+                &b.name
+            }
             Entity::ShellBasedSurfaceModel(b) => {
                 for v in &b.sbsm_boundary {
                     shell(step, *v, &mut mesh, &mut stats);
                 }
+                &b.name
             }
             Entity::BrepWithVoids(b) => {
                 // TODO: handle voids
-                closed_shell(step, b.outer, &mut mesh, &mut stats)
+                closed_shell(step, b.outer, &mut mesh, &mut stats);
+                &b.name
             }
             _ => {
                 warn!("Skipping {:?} (not a known solid)", entity);
                 continue;
             }
         };
-
         let v_end = mesh.verts.len();
         let t_end = mesh.triangles.len();
 
         // Create a NodeMesh
-        let mesh_idx = tree.meshes.len();
+        let mesh_idx = MeshIdx(tree.meshes.len() as u32);
         tree.meshes.push(NodeMesh {
             triangle_index: t_start as u32,
             triangle_count: (t_end - t_start) as u32,
+            name: Some(name.0.to_owned()),
         });
 
-        let item_id = Id::<RepresentationItem>::new(i);
-        item_to_mesh_idx.insert(item_id, mesh_idx);
+        // create Nodes that reference this NodeMesh
+        for (i, transform) in transforms.into_iter().enumerate() {
+            let node_idx = NodeIdx(tree.nodes.len() as u32);
+            tree.nodes.push(Node {
+                transform: glm::convert(transform),
+                children: vec![],
+                mesh: Some(mesh_idx),
+                name: Some(format!("{}[{}]", name.0, i)),
+            });
+
+            // for now, add each Node as the root of a separate Tree
+            tree.roots.push(node_idx);
+        }
     }
 
     dbg!(mesh.verts.len());
     dbg!(mesh.triangles.len());
     dbg!(stats);
-
-    tree.roots = item_to_mesh_idx
-        .values()
-        .map(|i| NodeIdx(*i as u32))
-        .collect();
 
     tree.vertices = mesh
         .verts
